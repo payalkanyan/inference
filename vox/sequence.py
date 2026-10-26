@@ -71,6 +71,11 @@ class Sequence:
     # -- deadline accounting ------------------------------------------------
     #: Engine clock reading when this request was admitted to the queue.
     arrival_time: float = 0.0
+    #: When it was *first* scheduled. Unchanged by a later preemption and
+    #: re-admission, so queue time means "how long before work started".
+    admitted_time: float | None = None
+    #: When it left the engine, however it left.
+    finished_time: float | None = None
     #: Seconds from arrival within which the first token must appear. None means
     #: no deadline, and such a request yields to those that have one.
     ttft_budget_s: float | None = None

@@ -107,6 +107,10 @@ class SchedulerOutput:
     def num_prefills(self) -> int:
         return sum(1 for kind in self.kinds if kind != "decode")
 
+    @property
+    def num_decodes(self) -> int:
+        return sum(1 for kind in self.kinds if kind == "decode")
+
 
 class Scheduler:
     def __init__(
@@ -144,6 +148,7 @@ class Scheduler:
         """Retire a sequence and give its blocks back immediately."""
         sequence.status = SequenceStatus.FINISHED
         sequence.finish_reason = reason
+        sequence.finished_time = self.clock()
         if sequence in self.running:
             self.running.remove(sequence)
         self.cache.free(sequence)
@@ -161,6 +166,7 @@ class Scheduler:
         """
         sequence.status = SequenceStatus.CANCELLED
         sequence.finish_reason = "cancelled"
+        sequence.finished_time = self.clock()
         if sequence in self.running:
             self.running.remove(sequence)
         if sequence in self.waiting:
@@ -365,6 +371,8 @@ class Scheduler:
             self.cache.allocate_for(candidate, chunk)
             self.waiting.remove(candidate)
             candidate.status = SequenceStatus.RUNNING
+            if candidate.admitted_time is None:
+                candidate.admitted_time = now
             self.running.append(candidate)
             out.add(candidate, chunk)
             out.newly_admitted.append(candidate)

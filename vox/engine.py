@@ -20,6 +20,12 @@ import torch
 
 from vox.batch import build_batch
 from vox.cache import PagedKVCache
+from vox.metrics import (
+    CancellationRecord,
+    IterationMetrics,
+    MetricsRecorder,
+    RequestMetrics,
+)
 from vox.model import Qwen2ForCausalLM
 from vox.sampler import SamplingParams, sample
 from vox.scheduler import Scheduler, SchedulerConfig, SchedulerOutput
@@ -71,38 +77,6 @@ def _snapshot(sequence: Sequence) -> RequestOutput:
     )
 
 
-@dataclass
-class CancellationRecord:
-    """What it cost to abandon one generation. The headline metric.
-
-    ``ticks_to_free`` is the number of engine iterations that elapsed between
-    ``cancel()`` being called and the blocks being back in the pool. It is zero
-    by construction -- cancellation does not go through the loop -- and the test
-    that asserts so is the one claim this project is really making.
-
-    ``blocks_retained`` is the other half: blocks the sequence was using that did
-    *not* come back, because another turn still references them. Freeing a
-    barge-in must not take the system prompt with it.
-    """
-
-    request_id: str
-    tick_at_cancel: int
-    tick_at_free: int
-    wall_seconds: float
-    blocks_held: int
-    blocks_released: int
-    tokens_generated: int
-    had_first_token: bool
-
-    @property
-    def ticks_to_free(self) -> int:
-        return self.tick_at_free - self.tick_at_cancel
-
-    @property
-    def blocks_retained(self) -> int:
-        return self.blocks_held - self.blocks_released
-
-
 class Engine:
     def __init__(
         self,
@@ -112,6 +86,7 @@ class Engine:
         *,
         generator: torch.Generator | None = None,
         clock: Callable[[], float] = time.monotonic,
+        metrics: MetricsRecorder | None = None,
     ) -> None:
         self.model = model
         self.cache = cache
@@ -119,10 +94,14 @@ class Engine:
         self.scheduler = Scheduler(cache, config, clock=clock)
         self.generator = generator
 
+        #: Collects per-request, per-iteration and per-cancellation records. The
+        #: default keeps them in memory only; pass one with a path to get JSONL.
+        self.metrics = metrics if metrics is not None else MetricsRecorder()
+        self._started = clock()
+
         #: Every request the engine has seen, by id, so that cancel() can find
         #: one and so stage 8 can report on requests that have already left.
         self.requests: dict[str, Sequence] = {}
-        self.cancellations: list[CancellationRecord] = []
         #: Prefix tokens -> a sequence that exists only to hold references.
         self._retained: dict[tuple[int, ...], Sequence] = {}
 
@@ -212,7 +191,8 @@ class Engine:
             tokens_generated=sequence.num_output_tokens,
             had_first_token=sequence.has_first_token,
         )
-        self.cancellations.append(record)
+        self.metrics.record_cancellation(record)
+        self._record_request(sequence)
         return record
 
     # -- keeping a declared prefix resident --------------------------------
@@ -283,8 +263,10 @@ class Engine:
             dtype=self.model.dtype,
         )
 
+        forward_started = self.clock()
         with torch.inference_mode():
             logits = self.model(batch.input_ids, batch.position_ids, state=batch.state)
+        forward_s = self.clock() - forward_started
 
         # The KV for these tokens is now in the cache.
         for sequence, query_len in zip(scheduled.sequences, scheduled.query_lens):
@@ -295,7 +277,37 @@ class Engine:
             self.num_blocks_published += len(self.cache.register_computed_blocks(sequence))
 
         self._sample_and_postprocess(batch, logits)
+        self._record_iteration(scheduled, batch, forward_s)
         return [_snapshot(s) for s in scheduled.sequences]
+
+    # -- instrumentation ---------------------------------------------------
+
+    def _record_iteration(self, scheduled: SchedulerOutput, batch, forward_s: float) -> None:
+        pool = self.cache.pool
+        self.metrics.record_iteration(
+            IterationMetrics(
+                tick=self.num_iterations,
+                elapsed_s=self.clock() - self._started,
+                forward_s=forward_s,
+                batch_size=batch.num_sequences,
+                query_tokens=batch.num_query_tokens,
+                num_prefill_chunks=scheduled.num_prefills,
+                num_decodes=scheduled.num_decodes,
+                blocks_used=pool.num_used_blocks,
+                blocks_free=pool.num_free_blocks,
+                block_utilization=pool.utilization,
+                cached_blocks=pool.num_cached_blocks,
+                preempted=len(scheduled.preempted),
+                urgently_admitted=len(scheduled.admitted_urgently),
+            )
+        )
+
+    def _record_request(self, sequence: Sequence) -> None:
+        self.metrics.record_request(RequestMetrics.from_sequence(sequence))
+
+    @property
+    def cancellations(self) -> list[CancellationRecord]:
+        return self.metrics.cancellations
 
     def _sample_and_postprocess(self, batch, logits: torch.Tensor) -> None:
         # Only sequences whose every token is now computed get to sample. A
@@ -324,8 +336,10 @@ class Engine:
 
             if token_id in sequence.stop_token_ids:
                 self.scheduler.finish(sequence, "stop")
+                self._record_request(sequence)
             elif sequence.num_output_tokens >= sequence.params.max_new_tokens:
                 self.scheduler.finish(sequence, "length")
+                self._record_request(sequence)
 
     # -- driving it to completion -----------------------------------------
 
