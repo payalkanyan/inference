@@ -1,0 +1,19 @@
+[project]
+name = "vox"
+version = "0.1.0"
+description = "A from-scratch LLM inference engine specialized for interruptible voice-agent traffic."
+requires-python = ">=3.11"
+dependencies = [
+    "torch",
+    "safetensors",
+    "transformers",  # tokenizer + the parity reference only; never used for the forward pass
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: needs the model weights on disk and takes a while on CPU",
+]
